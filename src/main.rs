@@ -11,11 +11,17 @@ use hal::{
     dma::{Channel0, Transfer},
     gpio::{gpiob, gpioc},
     interrupt,
+    otg_hs::{UsbBus, USB},
     pac::{DMA1, SPI2},
     prelude::*,
     stm32::{self, Interrupt},
+    time::Hertz,
 };
 use rtt_target::rprintln;
+use usb_audio::class::AudioClass;
+use usb_device::device::{UsbDeviceBuilder, UsbVidPid};
+
+static mut EP_MEMORY: [u32; 1024] = [0; 1024];
 
 static mut TOOTH: &'static mut [u16; 64] = &mut [
     0x000, 0x000, 0x100, 0x100, 0x200, 0x200, 0x300, 0x300, 0x400, 0x400, 0x500, 0x500, 0x600,
@@ -24,17 +30,6 @@ static mut TOOTH: &'static mut [u16; 64] = &mut [
     0xCFF, 0xBFF, 0xBFF, 0xAFF, 0xAFF, 0x9FF, 0x9FF, 0x8FF, 0x8FF, 0x7FF, 0x7FF, 0x6FF, 0x6FF,
     0x5FF, 0x5FF, 0x4FF, 0x4FF, 0x3FF, 0x3FF, 0x2FF, 0x2FF, 0x1FF, 0x1FF, 0x0FF, 0x0FF,
 ];
-
-// static mut TOOTH: &'static mut [u8; 128] = &mut [
-//     0x0, 0x0, 0x0, 0x0, 0x0, 0x1, 0x0, 0x1, 0x0, 0x2, 0x0, 0x2, 0x0, 0x3, 0x0, 0x3, 0x0, 0x4, 0x0,
-//     0x4, 0x0, 0x5, 0x0, 0x5, 0x0, 0x6, 0x0, 0x6, 0x0, 0x7, 0x0, 0x7, 0x0, 0x8, 0x0, 0x8, 0x0, 0x9,
-//     0x0, 0x9, 0x0, 0xA, 0x0, 0xA, 0x0, 0xB, 0x0, 0xB, 0x0, 0xC, 0x0, 0xC, 0x0, 0xD, 0x0, 0xD, 0x0,
-//     0xE, 0x0, 0xE, 0x0, 0xF, 0x0, 0xF, 0xFF, 0xF, 0xFF, 0xF, 0xFF, 0xE, 0xFF, 0xE, 0xFF, 0xD, 0xFF,
-//     0xD, 0xFF, 0xC, 0xFF, 0xC, 0xFF, 0xB, 0xFF, 0xB, 0xFF, 0xA, 0xFF, 0xA, 0xFF, 0x9, 0xFF, 0x9,
-//     0xFF, 0x8, 0xFF, 0x8, 0xFF, 0x7, 0xFF, 0x7, 0xFF, 0x6, 0xFF, 0x6, 0xFF, 0x5, 0xFF, 0x5, 0xFF,
-//     0x4, 0xFF, 0x4, 0xFF, 0x3, 0xFF, 0x3, 0xFF, 0x2, 0xFF, 0x2, 0xFF, 0x1, 0xFF, 0x1, 0xFF, 0x0,
-//     0xFF, 0x0,
-// ];
 
 type DmaTransfer = Transfer<
     Stream4<DMA1>,
@@ -54,7 +49,7 @@ fn main() -> ! {
     let clocks = rcc
         .cfgr
         .use_hse(8.mhz())
-        .sysclk(48.mhz())
+        .sysclk(96.mhz())
         .pclk1(24.mhz())
         .require_pll48clk()
         .freeze();
@@ -66,6 +61,14 @@ fn main() -> ! {
     let gpiod = dp.GPIOD.split();
 
     init_spi(&mut dp.SPI2, gpioc.pc3, gpiob.pb10, gpiob.pb12);
+    let usb = init_usb(
+        dp.OTG_HS_GLOBAL,
+        dp.OTG_HS_DEVICE,
+        dp.OTG_HS_PWRCLK,
+        gpiob.pb14,
+        gpiob.pb15,
+        clocks.hclk(),
+    );
 
     let stream_4 = StreamsTuple::new(dp.DMA1).4;
 
@@ -74,45 +77,56 @@ fn main() -> ! {
         .memory_increment(true)
         .double_buffer(true);
 
-    let i2s = dp.SPI2;
+    let mut transfer = DmaTransfer::init(
+        stream_4,
+        dp.SPI2,
+        unsafe { TOOTH },
+        Some(unsafe { TOOTH }),
+        config,
+    );
 
-    let mut transfer = DmaTransfer::init(stream_4, i2s, unsafe { TOOTH }, Some(unsafe {TOOTH}), config);
+    let bus = UsbBus::new(usb, unsafe { &mut EP_MEMORY });
+    let mut usb_audio = AudioClass::new(&bus);
+    let mut usb_dev = UsbDeviceBuilder::new(&bus, UsbVidPid(0x5824, 0x27dd))
+        .manufacturer("Albru")
+        .product("SuperHighTech audio device")
+        .serial_number("TEST")
+        .device_class(0)
+        .max_packet_size_0(64)
+        .build();
 
-    // unsafe { stm32::Peripherals::steal().DMA1.st[4].cr.modify(|_, w| w.circ().enabled()); }
+    // free(|_cs| unsafe {
+    //     NVIC::unpend(Interrupt::SPI2);
+    //     NVIC::unmask(Interrupt::SPI2);
 
-    free(|_cs| unsafe {
-        NVIC::unpend(Interrupt::SPI2);
-        NVIC::unmask(Interrupt::SPI2);
-
-        NVIC::unpend(Interrupt::DMA1_STREAM4);
-        NVIC::unmask(Interrupt::DMA1_STREAM4);
-    });
+    //     NVIC::unpend(Interrupt::DMA1_STREAM4);
+    //     NVIC::unmask(Interrupt::DMA1_STREAM4);
+    // });
 
     transfer.start(|_| {});
 
     loop {
-        // rprintln!("Loop");
-        asm::nop();
+        if usb_dev.poll(&mut [&mut usb_audio]) {}
     }
 }
 
-#[interrupt]
-fn DMA1_STREAM0() {
-    free(|_cs| unsafe {
-        rprintln!("DMA interrupt");
+// #[interrupt]
+// fn DMA1_STREAM0() {
+//     free(|_cs| unsafe {
+//         rprintln!("DMA interrupt");
 
-        NVIC::unpend(Interrupt::DMA1_STREAM4);
-    });
-}
+//         NVIC::unpend(Interrupt::DMA1_STREAM4);
+//     });
+// }
 
-#[interrupt]
-fn SPI2() {
-    free(|_cs| unsafe {
-        rprintln!("SPI interrupt");
+// #[interrupt]
+// fn SPI2() {
+//     free(|_cs| unsafe {
+//         rprintln!("SPI interrupt");
 
-        NVIC::unpend(Interrupt::SPI2);
-    });
-}
+//         NVIC::unpend(Interrupt::SPI2);
+//     });
+// }
 
 fn init_spi<X, Y, Z>(
     i2s: &mut stm32::SPI2,
@@ -153,4 +167,22 @@ fn init_spi<X, Y, Z>(
     pc3.into_alternate_af5();
     pb10.into_alternate_af5();
     pb12.into_alternate_af5();
+}
+
+fn init_usb<X, Y>(
+    hs_global: stm32::OTG_HS_GLOBAL,
+    hs_device: stm32::OTG_HS_DEVICE,
+    hs_pwrclk: stm32::OTG_HS_PWRCLK,
+    pb14: gpiob::PB14<X>,
+    pb15: gpiob::PB15<Y>,
+    hclk: Hertz,
+) -> USB {
+    USB {
+        usb_global: hs_global,
+        usb_device: hs_device,
+        usb_pwrclk: hs_pwrclk,
+        pin_dm: pb14.into_alternate_af12(),
+        pin_dp: pb15.into_alternate_af12(),
+        hclk: hclk,
+    }
 }
