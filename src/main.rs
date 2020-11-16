@@ -1,8 +1,16 @@
 #![no_std]
 #![no_main]
 
-use cortex_m::{asm, interrupt::free, peripheral::NVIC};
+use core::sync::atomic::{Ordering, compiler_fence};
+
+use cortex_m::{
+    asm,
+    interrupt::{free, Mutex},
+    peripheral::NVIC,
+    singleton,
+};
 use panic_rtt_target as _;
+use rtic::app;
 use stm32f4xx_hal as hal;
 
 use cortex_m_rt::entry;
@@ -19,75 +27,146 @@ use hal::{
 };
 use rtt_target::rprintln;
 use usb_audio::class::AudioClass;
-use usb_device::device::{UsbDeviceBuilder, UsbVidPid};
+use usb_device::{
+    class_prelude::UsbBusAllocator,
+    device::{UsbDevice, UsbDeviceBuilder, UsbVidPid},
+    UsbError,
+};
 
 static mut EP_MEMORY: [u32; 1024] = [0; 1024];
+static mut BUS: Option<UsbBusAllocator<UsbBus<USB>>> = None;
 
-static mut TOOTH: &'static mut [u16; 64] = &mut [
-    0x000, 0x000, 0x100, 0x100, 0x200, 0x200, 0x300, 0x300, 0x400, 0x400, 0x500, 0x500, 0x600,
-    0x600, 0x700, 0x700, 0x800, 0x800, 0x900, 0x900, 0xA00, 0xA00, 0xB00, 0xB00, 0xC00, 0xC00,
-    0xD00, 0xD00, 0xE00, 0xE00, 0xF00, 0xF00, 0xFFF, 0xFFF, 0xEFF, 0xEFF, 0xDFF, 0xDFF, 0xCFF,
-    0xCFF, 0xBFF, 0xBFF, 0xAFF, 0xAFF, 0x9FF, 0x9FF, 0x8FF, 0x8FF, 0x7FF, 0x7FF, 0x6FF, 0x6FF,
-    0x5FF, 0x5FF, 0x4FF, 0x4FF, 0x3FF, 0x3FF, 0x2FF, 0x2FF, 0x1FF, 0x1FF, 0x0FF, 0x0FF,
-];
-
+type Buffer = &'static mut [u16; 96];
 type DmaTransfer = Transfer<
     Stream4<DMA1>,
     Channel0,
     SPI2,
     MemoryToPeripheral,
-    &'static mut [u16; 64],
+    Buffer,
     u16, /* transfer size */
 >;
 
-#[entry]
-fn main() -> ! {
-    let mut dp = stm32::Peripherals::take().unwrap();
-    let mut cortex = cortex_m::peripheral::Peripherals::take().unwrap();
-    let rcc = dp.RCC.constrain();
+enum DmaState {
+    Disabled,
+    Enabled
+}
 
-    let clocks = rcc
-        .cfgr
-        .use_hse(8.mhz())
-        .sysclk(96.mhz())
-        .pclk1(24.mhz())
-        .require_pll48clk()
-        .freeze();
+#[app(device = stm32f4xx_hal::pac, peripherals = true)]
+const APP: () = {
+    struct Resources {
+        audio_class: AudioClass<'static, UsbBus<USB>>,
+        usb_device: UsbDevice<'static, UsbBus<USB>>,
+        transfer: DmaTransfer,
+        third_buffer: Option<Buffer>,
+        #[init(DmaState::Disabled)]
+        dma_state: DmaState,
+    }
 
-    rtt_target::rtt_init_print!();
+    #[init]
+    fn init(cx: init::Context) -> init::LateResources {
+        let core: cortex_m::Peripherals = cx.core;
+        let mut device: hal::pac::Peripherals = cx.device;
 
-    let gpiob = dp.GPIOB.split();
-    let gpioc = dp.GPIOC.split();
-    let gpiod = dp.GPIOD.split();
+        let clocks = device
+            .RCC
+            .constrain()
+            .cfgr
+            .use_hse(8.mhz())
+            .sysclk(96.mhz())
+            .pclk1(24.mhz())
+            .require_pll48clk()
+            .freeze();
 
-    init_spi(&mut dp.SPI2, gpioc.pc3, gpiob.pb10, gpiob.pb12);
-    let usb = init_usb(
-        dp.OTG_HS_GLOBAL,
-        dp.OTG_HS_DEVICE,
-        dp.OTG_HS_PWRCLK,
-        gpiob.pb14,
-        gpiob.pb15,
-        clocks.hclk(),
-    );
+        rtt_target::rtt_init_print!();
 
-    let stream_4 = StreamsTuple::new(dp.DMA1).4;
+        let gpiob = device.GPIOB.split();
+        let gpioc = device.GPIOC.split();
 
-    let config = DmaConfig::default()
-        .transfer_complete_interrupt(true)
-        .memory_increment(true)
-        .double_buffer(true);
+        init_spi(&mut device.SPI2, gpioc.pc3, gpiob.pb10, gpiob.pb12);
 
-    let mut transfer = DmaTransfer::init(
-        stream_4,
-        dp.SPI2,
-        unsafe { TOOTH },
-        Some(unsafe { TOOTH }),
-        config,
-    );
+        let usb = init_usb_peripheral(
+            device.OTG_HS_GLOBAL,
+            device.OTG_HS_DEVICE,
+            device.OTG_HS_PWRCLK,
+            gpiob.pb14,
+            gpiob.pb15,
+            clocks.hclk(),
+        );
 
-    let bus = UsbBus::new(usb, unsafe { &mut EP_MEMORY });
-    let mut usb_audio = AudioClass::new(&bus);
-    let mut usb_dev = UsbDeviceBuilder::new(&bus, UsbVidPid(0x5824, 0x27dd))
+        unsafe {
+            BUS = Some(UsbBus::new(usb, &mut EP_MEMORY));
+        }
+
+        let first_buffer = singleton!(: [u16; 96] = [0; 96]).unwrap();
+        let second_buffer = singleton!(: [u16; 96] = [0; 96]).unwrap();
+        let third_buffer = singleton!(: [u16; 96] = [0; 96]).unwrap();
+
+        let (audio_class, usb_device) = init_usb(unsafe { BUS.as_ref().unwrap() });
+        let transfer = init_dma(device.DMA1, device.SPI2, first_buffer, second_buffer);
+
+        rprintln!("initialized");
+
+        init::LateResources {
+            audio_class,
+            usb_device,
+            transfer,
+            third_buffer: Some(third_buffer),
+        }
+    }
+
+    #[idle(resources = [transfer])]
+    fn idle(mut cx: idle::Context) -> ! {
+        rprintln!("idle");
+
+        cx.resources.transfer.lock(|transfer| transfer.start(|_| {}));
+
+        rprintln!("transfer started");
+
+        loop {
+            compiler_fence(Ordering::SeqCst);
+        }
+    }
+
+    #[task(binds = OTG_HS, resources = [usb_device, audio_class, third_buffer])]
+    fn otg_hs(cx: otg_hs::Context) {
+        if !cx.resources.usb_device.poll(&mut [cx.resources.audio_class]) {
+            return;
+        }
+
+        let buf = cx.resources.third_buffer.as_deref_mut().unwrap();        
+
+        let (_, aligned_buf, _) = unsafe { buf.align_to_mut::<u8>() };
+
+        match cx.resources.audio_class.read_data(aligned_buf) {
+            Ok(_) => (), //rprintln!("data read"),
+            Err(UsbError::WouldBlock) => (),
+            Err(_) => panic!("usb error"),
+        };
+    }
+
+    #[task(binds = DMA1_STREAM4, resources = [third_buffer, transfer])]
+    fn dma1_stream4(cx: dma1_stream4::Context) {
+        let triple: Buffer = cx.resources.third_buffer.take().unwrap();
+        let buf = cx
+            .resources
+            .transfer
+            .next_transfer(triple)
+            .map_err(|_| {})
+            .unwrap()
+            .0;
+        
+        *cx.resources.third_buffer = Some(buf);
+    }
+};
+
+fn init_usb(
+    bus: &'static UsbBusAllocator<UsbBus<USB>>,
+) -> (
+    AudioClass<'static, UsbBus<USB>>,
+    UsbDevice<'static, UsbBus<USB>>,
+) {
+    let usb_audio = AudioClass::new(bus);
+    let usb_dev = UsbDeviceBuilder::new(bus, UsbVidPid(0x5824, 0x27dd))
         .manufacturer("Albru")
         .product("SuperHighTech audio device")
         .serial_number("TEST")
@@ -95,19 +174,23 @@ fn main() -> ! {
         .max_packet_size_0(64)
         .build();
 
-    // free(|_cs| unsafe {
-    //     NVIC::unpend(Interrupt::SPI2);
-    //     NVIC::unmask(Interrupt::SPI2);
+    (usb_audio, usb_dev)
+}
 
-    //     NVIC::unpend(Interrupt::DMA1_STREAM4);
-    //     NVIC::unmask(Interrupt::DMA1_STREAM4);
-    // });
+fn init_dma(
+    dma1: hal::pac::DMA1,
+    spi2: hal::pac::SPI2,
+    first_buffer: Buffer,
+    second_buffer: Buffer,
+) -> DmaTransfer {
+    let stream_4 = StreamsTuple::new(dma1).4;
 
-    transfer.start(|_| {});
+    let config = DmaConfig::default()
+        .transfer_complete_interrupt(true)
+        .memory_increment(true)
+        .double_buffer(true);
 
-    loop {
-        if usb_dev.poll(&mut [&mut usb_audio]) {}
-    }
+    DmaTransfer::init(stream_4, spi2, first_buffer, Some(second_buffer), config)
 }
 
 // #[interrupt]
@@ -169,7 +252,7 @@ fn init_spi<X, Y, Z>(
     pb12.into_alternate_af5();
 }
 
-fn init_usb<X, Y>(
+fn init_usb_peripheral<X, Y>(
     hs_global: stm32::OTG_HS_GLOBAL,
     hs_device: stm32::OTG_HS_DEVICE,
     hs_pwrclk: stm32::OTG_HS_PWRCLK,

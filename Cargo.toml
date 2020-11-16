@@ -12,10 +12,15 @@ rtt-target = { version = "0.2.2", features = ["cortex-m"] }
 panic-rtt-target = { version = "0.1.1", features = ["cortex-m"] }
 embedded-hal = "0.2.4"
 # stm32f4xx-hal = { version = "0.8.3", features = ["stm32f429", "rt"] }
-stm32f4xx-hal = { path = "../stm32f4xx-hal", features = ["stm32f429", "rt", "usb_hs"] }
-usb-audio = { path = "../usb-audio" }
-usb-device = { path = "../usb-device" }
+stm32f4xx-hal = { git = "https://github.com/albru123/stm32f4xx-hal", features = ["stm32f429", "rt", "usb_hs"] }
+usb-audio = { git = "https://github.com/albru123/usb-audio", branch = "master" }
+usb-device = "0.2.0"
+cortex-m-rtic = "0.5.5"
+heapless = "0.5.6"
 bbqueue = "0.4.10"
+
+[patch.crates-io]
+usb-device = { git = "https://github.com/albru123/usb-device", branch = "audio-changes" }
 
 # this lets you use `cargo fix`!
 [[bin]]
