@@ -1,7 +1,7 @@
 #![no_std]
 #![no_main]
 
-use core::sync::atomic::{Ordering, compiler_fence};
+use core::{ops::Deref, sync::atomic::{Ordering, compiler_fence}};
 
 use cortex_m::{
     asm,
@@ -14,17 +14,7 @@ use rtic::app;
 use stm32f4xx_hal as hal;
 
 use cortex_m_rt::entry;
-use hal::{
-    dma::{config::DmaConfig, MemoryToPeripheral, Stream4, StreamsTuple},
-    dma::{Channel0, Transfer},
-    gpio::{gpiob, gpioc},
-    interrupt,
-    otg_hs::{UsbBus, USB},
-    pac::{DMA1, SPI2},
-    prelude::*,
-    stm32::{self, Interrupt},
-    time::Hertz,
-};
+use hal::{dma::{config::DmaConfig, MemoryToPeripheral, Stream4, StreamsTuple}, dma::{Channel0, Transfer, traits::{DMASet, PeriAddress}}, gpio::{gpiob, gpioc}, interrupt, otg_hs::{UsbBus, USB}, pac::{DMA1, SPI2, spi1}, prelude::*, stm32::{self, Interrupt}, time::Hertz};
 use rtt_target::rprintln;
 use usb_audio::class::AudioClass;
 use usb_device::{
@@ -36,14 +26,34 @@ use usb_device::{
 static mut EP_MEMORY: [u32; 1024] = [0; 1024];
 static mut BUS: Option<UsbBusAllocator<UsbBus<USB>>> = None;
 
+pub struct MyDMA;
+
+// impl Deref for MyDMA {
+//     type Target = spi1::RegisterBlock;
+//     #[inline(always)]
+//     fn deref(&self) -> &Self::Target {
+//         unsafe { &*SPI2::ptr() }
+//     }
+// }
+
+unsafe impl PeriAddress for MyDMA {
+    type MemSize = u16;
+
+    fn address(&self) -> u32 {
+        //&self.dr as *const _ as u32
+        unsafe { &(&*SPI2::ptr()).dr as *const _ as u32 }
+    }
+}
+
+unsafe impl DMASet<Stream4<DMA1>, Channel0, MemoryToPeripheral> for MyDMA {}
+
 type Buffer = &'static mut [u16; 96];
 type DmaTransfer = Transfer<
     Stream4<DMA1>,
     Channel0,
-    SPI2,
+    MyDMA,
     MemoryToPeripheral,
     Buffer,
-    u16, /* transfer size */
 >;
 
 enum DmaState {
@@ -190,7 +200,7 @@ fn init_dma(
         .memory_increment(true)
         .double_buffer(true);
 
-    DmaTransfer::init(stream_4, spi2, first_buffer, Some(second_buffer), config)
+    DmaTransfer::init(stream_4, MyDMA{}, first_buffer, Some(second_buffer), config)
 }
 
 // #[interrupt]
